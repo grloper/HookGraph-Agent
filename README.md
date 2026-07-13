@@ -192,9 +192,16 @@ non-overlap/duration/sync invariants on the final packages, graceful degradation
 impossible inputs, strategy-ladder escalation, the interrupt/resume review gate, and
 checkpoint history.
 
-## 🎥 The demo GIF — AI video-generator prompt
+## 🎥 Demo
 
-> Feed this prompt to your AI video generator of choice to produce the hero demo.
+> One episode in. Three bangers out. Zero babysitting.
+
+https://github.com/grloper/HookGraph-Agent/raw/main/assets/demo.mp4
+
+<video src="https://github.com/grloper/HookGraph-Agent/raw/main/assets/demo.mp4" controls muted loop width="820"></video>
+
+<details>
+<summary>The AI-video-generator prompt used to produce this demo</summary>
 
 ```text
 A cinematic 25-second screen-capture-style demo of an AI agent system, 4K, dark-mode
@@ -235,6 +242,8 @@ supervisor, cyan for workers, green for QC passes, red for QC failures), smooth
 resolves on the final stamp.
 ```
 
+</details>
+
 ## Repository structure
 
 ```
@@ -242,6 +251,7 @@ HookGraph-Agent/
 ├── main.py                        # CLI entry: engine selection, streaming, interrupt handling
 ├── requirements.txt               # 3 pinned runtime deps — fully offline
 ├── requirements-dev.txt           # + pytest
+├── assets/demo.mp4                # the hero demo video
 ├── tests/                         # 26 tests: engines, reducers, e2e, degradation, interrupts
 └── hookgraph/
     ├── state.py                   # Pydantic payload models, reducers, graph state
