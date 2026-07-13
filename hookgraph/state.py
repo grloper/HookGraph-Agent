@@ -221,6 +221,25 @@ def replace_value(existing: object, incoming: object) -> object:
     return incoming
 
 
+def merge_repair_memory(
+    existing: dict[str, list[str]], incoming: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Accumulator for the self-correcting repair-memory stream.
+
+    Keys are ``"{hook_id}:{rule}"``; values are the ordered list of repair
+    strategies already attempted for that failure. Incoming strategies append
+    without duplication, so the Showrunner always sees the complete history of
+    what has been tried and never prescribes the same failed strategy twice.
+    """
+    merged = {key: list(strategies) for key, strategies in existing.items()}
+    for key, strategies in incoming.items():
+        seen = merged.setdefault(key, [])
+        for strategy in strategies:
+            if strategy not in seen:
+                seen.append(strategy)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Section 3 — The graph state
 # ---------------------------------------------------------------------------
@@ -248,6 +267,11 @@ class HookGraphState(TypedDict):
     extraction_attempts: Annotated[int, replace_value]
     max_extraction_attempts: int
 
+    # Showrunner (supervisor) control channels
+    repair_directives: Annotated[dict[str, str], replace_value]
+    repair_memory: Annotated[dict[str, list[str]], merge_repair_memory]
+    reviewer_note: Annotated[str, replace_value]
+
     # Final compiled output
     final_packages: list[ClipPackage]
     pipeline_degraded: bool
@@ -272,6 +296,9 @@ def initial_state(
         active_violations=[],
         extraction_attempts=0,
         max_extraction_attempts=max_extraction_attempts,
+        repair_directives={},
+        repair_memory={},
+        reviewer_note="",
         final_packages=[],
         pipeline_degraded=False,
         pipeline_events=[

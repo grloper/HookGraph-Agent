@@ -1,15 +1,17 @@
-"""HookGraph-Agents entry point.
+"""HookGraph entry point.
 
-Compiles the LangGraph pipeline and runs a full simulation: a long-form
-transcript goes in, three QC-approved vertical clip packages come out. Runs
-completely offline — the analytical engines are deterministic, so no API keys
-are required.
+Compiles the LangGraph multi-agent ecosystem and runs a full production pass:
+a long-form transcript goes in, three QC-approved vertical clip packages come
+out. Runs completely offline by default — the analytical engines are
+deterministic, so no API keys are required.
 
 Usage::
 
     python main.py                            # run on the bundled demo episode
     python main.py --transcript episode.json  # run on your own transcript
     python main.py --output-dir dist          # choose the export directory
+    python main.py --llm                      # Claude-powered titling (needs ANTHROPIC_API_KEY)
+    python main.py --review                   # pause for a human note if QC degrades
 
 Custom transcript JSON shape::
 
@@ -26,12 +28,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-from HookGraph.graph import build_graph
-from HookGraph.sample_data import load_sample_transcript
-from HookGraph.state import (
+from langgraph.types import Command
+
+from hookgraph.engines import build_creative_engine
+from hookgraph.graph import build_graph
+from hookgraph.sample_data import load_sample_transcript
+from hookgraph.state import (
     ClipPackage,
     SourceVideo,
     TranscriptSegment,
@@ -44,7 +50,7 @@ DIVIDER = "=" * 78
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="HookGraph",
+        prog="hookgraph",
         description="Repurpose a long-form video transcript into 3 vertical clip packages.",
     )
     parser.add_argument(
@@ -63,12 +69,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--max-attempts",
         type=int,
         default=4,
-        help="QC retry budget for the HookExtractor before degrading (default: 4).",
+        help="QC retry budget for the corrective loop before degrading (default: 4).",
+    )
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help=(
+            "Use the Claude creative engine for hook titling (requires the "
+            "'anthropic' package and ANTHROPIC_API_KEY; falls back to the "
+            "deterministic engine on any failure). Also enabled by HOOKGRAPH_LLM=1."
+        ),
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "Enable the human-review gate: if QC cannot fully converge, pause "
+            "on a durable interrupt and ask for a reviewer note before shipping "
+            "the degraded batch."
+        ),
     )
     parser.add_argument(
         "--thread-id",
-        default="HookGraph-demo-run",
-        help="Checkpointer thread id for this run (default: HookGraph-demo-run).",
+        default="hookgraph-demo-run",
+        help="Checkpointer thread id for this run (default: hookgraph-demo-run).",
     )
     return parser.parse_args(argv)
 
@@ -110,6 +134,11 @@ def print_final_report(state: HookGraphState) -> None:
         for violation in report.violations:
             print(f"    - [{violation.severity}] {violation.rule}: {violation.message}")
 
+    if state["repair_memory"]:
+        print(f"\n{DIVIDER}\nSHOWRUNNER REPAIR MEMORY\n{DIVIDER}")
+        for key, strategies in sorted(state["repair_memory"].items()):
+            print(f"  {key}: {' -> '.join(strategies)}")
+
     print(f"\n{DIVIDER}\nPIPELINE EVENT LOG\n{DIVIDER}")
     for event in state["pipeline_events"]:
         print(f"  * {event}")
@@ -132,6 +161,8 @@ def export_packages(
         "source_video": source.model_dump(),
         "pipeline_degraded": state["pipeline_degraded"],
         "qc_attempts": state["extraction_attempts"],
+        "reviewer_note": state.get("reviewer_note", ""),
+        "repair_memory": state.get("repair_memory", {}),
         "packages": [package.model_dump() for package in state["final_packages"]],
         "qc_reports": [report.model_dump() for report in state["qc_reports"]],
         "pipeline_events": state["pipeline_events"],
@@ -142,6 +173,47 @@ def export_packages(
     return written
 
 
+def _stream_run(app, run_input, config) -> None:
+    """Stream one graph execution segment, printing node-attributed events."""
+    for chunk in app.stream(run_input, config=config, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            if not isinstance(update, dict):
+                continue  # e.g. the __interrupt__ marker chunk
+            for event in update.get("pipeline_events", []):
+                print(f"  [{node_name}] {event.split('] ', 1)[-1]}")
+
+
+def _resolve_interrupts(app, config) -> bool:
+    """If the run paused on a human-review interrupt, collect a note and resume.
+
+    Returns True when an interrupt was handled and the caller should stream
+    the continuation; False when the run has genuinely finished.
+    """
+    snapshot = app.get_state(config)
+    if not snapshot.next:
+        return False
+    pending = [
+        intr for task in snapshot.tasks for intr in getattr(task, "interrupts", ())
+    ]
+    if not pending:
+        return False
+
+    payload = pending[0].value
+    print(f"\n{DIVIDER}\nHUMAN REVIEW GATE — pipeline paused (checkpoint persisted)\n{DIVIDER}")
+    print(f"  Reason: {payload.get('reason', 'unknown')}")
+    for line in payload.get("open_violations", []):
+        print(f"    - {line}")
+    print(f"\n  {payload.get('question', '')}")
+    if sys.stdin.isatty():
+        note = input("  Reviewer note (enter to approve): ").strip()
+    else:
+        note = "auto-approved (non-interactive run)"
+        print(f"  Non-interactive session -> resuming with note: '{note}'")
+    print()
+    _stream_run(app, Command(resume=note or "approved without comment"), config)
+    return True
+
+
 def run(argv: list[str]) -> int:
     args = parse_args(argv)
 
@@ -150,21 +222,32 @@ def run(argv: list[str]) -> int:
     else:
         source, segments = load_sample_transcript()
 
-    print(f"{DIVIDER}\nHookGraph-Agents — short-form repurposing pipeline\n{DIVIDER}")
+    use_llm = args.llm or os.environ.get("HOOKGRAPH_LLM", "") in ("1", "true", "anthropic")
+    engine, engine_note = build_creative_engine(use_llm)
+
+    print(f"{DIVIDER}\nHookGraph — supervisor-orchestrated short-form repurposing ecosystem\n{DIVIDER}")
     print(
-        f"Source: '{source.title}' ({source.duration_seconds:.0f}s, "
-        f"{len(segments)} transcript segments)\n"
+        f"Source : '{source.title}' ({source.duration_seconds:.0f}s, "
+        f"{len(segments)} transcript segments)"
     )
+    print(f"Engine : {engine_note}")
+    print(f"Review : {'human gate armed (--review)' if args.review else 'autonomous (degraded batches ship flagged)'}\n")
 
     app = build_graph()
-    config = {"configurable": {"thread_id": args.thread_id}, "recursion_limit": 50}
+    config = {
+        "configurable": {
+            "thread_id": args.thread_id,
+            "creative_engine": engine,
+            "review_gate": args.review,
+        },
+        "recursion_limit": 60,
+    }
     state = initial_state(source, segments, max_extraction_attempts=args.max_attempts)
 
     print("Executing graph (streaming node updates):\n")
-    for chunk in app.stream(state, config=config, stream_mode="updates"):
-        for node_name, update in chunk.items():
-            for event in update.get("pipeline_events", []):
-                print(f"  [{node_name}] {event.split('] ', 1)[-1]}")
+    _stream_run(app, state, config)
+    while _resolve_interrupts(app, config):
+        pass
 
     snapshot = app.get_state(config)
     final_state: HookGraphState = snapshot.values
@@ -179,7 +262,8 @@ def run(argv: list[str]) -> int:
     checkpoints = sum(1 for _ in app.get_state_history(config))
     print(
         f"\nDurable execution: {checkpoints} checkpoints recorded for thread "
-        f"'{args.thread_id}' (every super-step, including each QC retry, is resumable)."
+        f"'{args.thread_id}' (every super-step, including each QC retry and any "
+        f"review pause, is resumable)."
     )
 
     if final_state["pipeline_degraded"]:
