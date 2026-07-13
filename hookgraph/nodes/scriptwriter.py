@@ -1,6 +1,9 @@
-"""Scriptwriter node — caption sequencing and platform metadata drafting.
+"""Scriptwriter workers — parallel caption sequencing and metadata drafting.
 
-For every current hook it produces:
+The Scriptwriter is no longer a single node that loops over hooks: it is a
+**worker** that receives exactly one hook via the LangGraph ``Send`` API and
+is fanned out in parallel — one instance per hook whose artifacts are stale.
+For its hook it produces:
 
 1. A pristine, timestamp-synced caption track. Source segments are rebased to
    clip-relative time, split into short vertical-friendly cues (max 42 chars),
@@ -10,11 +13,16 @@ For every current hook it produces:
    descriptions for YouTube Shorts, sound/trend tags for TikTok, and
    save-oriented hashtag stacks for Instagram Reels.
 
-The node is idempotent per (hook_id, revision): repaired hooks get fresh
-tracks/packages and the upsert reducers replace the stale ones in state.
+Parallel writes are safe *by construction*: the ``caption_tracks`` and
+``metadata_packages`` channels carry upsert-by-hook_id reducers, and the
+event log is append-only, so three concurrent workers merge cleanly into one
+super-step. Work is idempotent per (hook_id, revision): only stale artifacts
+are ever dispatched (see ``routing.dispatch_scriptwriters``).
 """
 
 from __future__ import annotations
+
+from typing import TypedDict
 
 from langchain_core.runnables import RunnableConfig
 
@@ -27,7 +35,6 @@ from ..state import (
     PlatformVariant,
     SourceVideo,
     TranscriptSegment,
-    HookGraphState,
 )
 
 MAX_CUE_CHARS = 42
@@ -38,6 +45,14 @@ _SOUND_MOODS = {
     "semantic_density": "lo-fi focus beat, low-volume bed under voice",
     "topic_transition": "record-scratch transition sting into ambient pad",
 }
+
+
+class ScriptwriterPayload(TypedDict):
+    """The Send envelope one worker instance receives from the dispatcher."""
+
+    hook: HookCandidate
+    transcript: list[TranscriptSegment]
+    source_video: SourceVideo
 
 
 def _chunk_text(text: str, max_chars: int) -> list[str]:
@@ -191,31 +206,21 @@ def _build_metadata_package(
     )
 
 
-def scriptwriter_node(state: HookGraphState, config: RunnableConfig) -> dict:
-    """LangGraph node handler: (re)draft captions + metadata for current hooks."""
-    segments_by_id = {segment.segment_id: segment for segment in state["transcript"]}
-    existing_tracks = {
-        track.hook_id: track.hook_revision for track in state["caption_tracks"]
-    }
+def scriptwriter_node(payload: ScriptwriterPayload, config: RunnableConfig) -> dict:
+    """LangGraph Send worker: draft captions + metadata for exactly one hook."""
+    hook = payload["hook"]
+    segments_by_id = {segment.segment_id: segment for segment in payload["transcript"]}
 
-    tracks: list[CaptionTrack] = []
-    packages: list[MetadataPackage] = []
-    refreshed: list[str] = []
-    for hook in state["hooks"]:
-        if existing_tracks.get(hook.hook_id) == hook.revision:
-            continue  # artifact already in sync with this hook revision
-        tracks.append(_build_caption_track(hook, segments_by_id))
-        packages.append(_build_metadata_package(hook, state["source_video"], segments_by_id))
-        refreshed.append(f"{hook.hook_id}(rev {hook.revision})")
+    track = _build_caption_track(hook, segments_by_id)
+    package = _build_metadata_package(hook, payload["source_video"], segments_by_id)
 
-    total_cues = sum(len(track.cues) for track in tracks)
     event = (
-        f"[Scriptwriter] Drafted {len(tracks)} caption tracks ({total_cues} cues) "
-        f"and {len(packages)} tri-platform metadata packages for: "
-        f"{', '.join(refreshed) if refreshed else 'no hooks (all artifacts current)'}."
+        f"[Scriptwriter:{hook.hook_id}] Drafted caption track "
+        f"({len(track.cues)} cues, SRT ready) and tri-platform metadata for "
+        f"{hook.hook_id} (rev {hook.revision}) in a parallel worker."
     )
     return {
-        "caption_tracks": tracks,
-        "metadata_packages": packages,
+        "caption_tracks": [track],
+        "metadata_packages": [package],
         "pipeline_events": [event],
     }

@@ -62,12 +62,17 @@ def package_compiler_node(state: HookGraphState, config: RunnableConfig) -> dict
         )
 
     status = (
-        "flagged for human review (QC retries exhausted)" if degraded else "fully QC-approved"
+        "flagged for human review (QC could not fully converge)"
+        if degraded
+        else "fully QC-approved"
     )
+    reviewer_note = state.get("reviewer_note", "")
+    note_suffix = f" Reviewer note attached: '{reviewer_note}'." if reviewer_note else ""
     event = (
         f"[PackageCompiler] Compiled {len(packages)} short-form clip packages "
         f"({status}) totalling "
-        f"{sum(package.hook.duration_seconds for package in packages):.0f}s of vertical content."
+        f"{sum(package.hook.duration_seconds for package in packages):.0f}s "
+        f"of vertical content.{note_suffix}"
     )
     return {
         "final_packages": packages,
